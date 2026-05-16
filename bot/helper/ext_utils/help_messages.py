@@ -289,19 +289,19 @@ video_tools = """<b>Video Tools</b>: -vt
 Open a post-download FFmpeg toolbox (12 ops: merge V+V/V+A/V+S, soft-mux, hardsub, subsync, compress, trim, watermark, remove/extract video stream, custom-extract, resize) right after the download finishes. The menu is also reachable standalone via /vtools.
 
 <b>Usage:</b>
-/cmd link -vt                    (open the menu after download)
-/cmd link -vt -m folder name     (multi-mode: required by all merge ops)
+/cmd link -vt                 (open the menu after download)
+/cmd -i 2 -vt                 (multi-link: download both first, then mux)
 
 <b>Auto-Mux fast path</b> (default ON, controlled by <code>VT_AUTO_MUX</code>):
-When you pass <b>-vt -m</b> and the work-dir contains at least one video <i>and</i> one external audio file, the bot soft-muxes them into a single .mkv automatically (lang=und, codecs copied — no re-encode) and skips the menu. Set <code>VT_AUTO_MUX=False</code> in config to always force the picker.
+When you pass <b>-vt</b> and the work-dir contains at least one video <i>and</i> one external audio file, the bot soft-muxes them into a single .mkv automatically (lang=und, codecs copied — no re-encode) and skips the menu. Set <code>VT_AUTO_MUX=False</code> in config to always force the picker.
 
 <b>Quick Mux button:</b>
-The keyboard now exposes <b>⚡ Quick Mux (V+A, no prompt)</b> which runs the same one-tap soft-mux without asking for a language tag.
+The keyboard exposes <b>⚡ Quick Mux (V+A, no prompt)</b> which runs the same one-tap soft-mux without asking for a language tag.
 
 <b>Notes:</b>
-1. Merge ops (V+V, V+A, V+S, Quick Mux) require <b>-m</b>.
-2. <b>-n</b> (rename) is rejected with merge ops.
-3. Without <b>-m</b>, only the first video in the work-dir is processed."""
+1. <b>-m</b> is NOT required for merge ops anymore. Just pass <b>-vt</b> (and use <b>-i N</b> if you need to download N inputs first).
+2. <b>-n</b> (rename) is rejected with merge ops because the bot picks an auto suffix (`merged_audio.mkv` / `softsub.mkv` / `merged_output.mkv`).
+3. The merge keyboard pairs videos[i] with audios[i] round-robin against everything in the work-dir."""
 
 YT_HELP_DICT = {
     "main": yt,
