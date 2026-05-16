@@ -115,6 +115,7 @@ CALLBACK_PREFIX = "vt"
 # Operation codes used in callback_data and routing
 OP_MERGE_VV   = "mvv"
 OP_MERGE_VA   = "mva"
+OP_QUICK_MUX  = "qmx"   # one-tap mux: first video + first audio, lang=und
 OP_MERGE_VS   = "mvs"
 OP_HARDSUB    = "hsb"
 OP_SUBSYNC    = "ssy"
@@ -302,6 +303,7 @@ def build_video_tools_keyboard(session_id: int) -> Any:
     buttons.data_button("🎬 Merge Video+Video", f"{CALLBACK_PREFIX} {s} {OP_MERGE_VV}")
     buttons.data_button("🔊 Merge Video+Audio", f"{CALLBACK_PREFIX} {s} {OP_MERGE_VA}")
 
+    buttons.data_button("⚡ Quick Mux (V+A, no prompt)", f"{CALLBACK_PREFIX} {s} {OP_QUICK_MUX}")
     buttons.data_button("📝 Merge Video+Subtitle", f"{CALLBACK_PREFIX} {s} {OP_MERGE_VS}")
     buttons.data_button("🔥 Hardsub (sudo)", f"{CALLBACK_PREFIX} {s} {OP_HARDSUB}")
 
@@ -1555,6 +1557,33 @@ async def video_tools_callback(client, query):
         await query.answer()
         return
 
+    # ---- Quick Mux (one-tap V+A) ----------------------------------------
+    # Soft-mux the first audio in the work-dir into the first video, with no
+    # language picker. Same engine as Merge V+A but skips the sub-menu.
+    if op == OP_QUICK_MUX:
+        err = _validate_pre_click(session, OP_MERGE_VA)
+        if err:
+            await query.answer(err, show_alert=True)
+            return
+        await edit_message(
+            query.message,
+            "⏳ Quick Mux running (V + A, lang=und) …",
+            buttons=None,
+        )
+        await query.answer("Started")
+        ok, msg, outputs = await _process_op(session, OP_MERGE_VA, extra="und")
+        if not ok:
+            await edit_message(query.message, f"❌ {msg}")
+            return
+        listing = "\n".join(f"• `{ospath.basename(o)}`" for o in outputs)
+        await edit_message(
+            query.message,
+            f"✅ {msg}\nProduced {len(outputs)} file(s):\n{listing}",
+        )
+        await _handoff_to_listener(session, outputs)
+        VT_SESSIONS.pop(session_id, None)
+        return
+
     # ---- Custom Extract sub-flow ----------------------------------------
     # First click opens the picker; subsequent clicks toggle / run / clear.
     if op == OP_CUSTOM_EX:
@@ -1911,6 +1940,13 @@ async def process_video_tools(listener) -> None:
             from ...modules.video_tools import process_video_tools
             await process_video_tools(self)
             return
+
+    Auto-mux short-circuit (controlled by ``Config.VT_AUTO_MUX``):
+      When the user passed ``-vt -m`` and the work-dir contains both at
+      least one video AND at least one external audio, we soft-mux the
+      audio into the video (lang=und) without ever showing the menu, then
+      hand the produced .mkv back to the listener for upload. This makes
+      the very common "merge audio into video" flow a single command.
     """
     work_dir = getattr(listener, "dir", None) or await _resolve_work_dir(
         getattr(listener, "user_id", 0), listener
@@ -1919,6 +1955,61 @@ async def process_video_tools(listener) -> None:
         getattr(listener, "folder_name", "")
     )
     rename = getattr(listener, "name", "") if getattr(listener, "_user_renamed", False) else ""
+
+    # ---- Auto-mux fast path ---------------------------------------------
+    if (
+        getattr(Config, "VT_AUTO_MUX", True)
+        and multi
+        and work_dir
+        and await aiopath.isdir(work_dir)
+    ):
+        try:
+            videos = await find_videos(work_dir)
+            audios = await find_audios(work_dir)
+        except Exception as e:
+            LOGGER.error(f"[VT] auto-mux scan failed: {e}")
+            videos, audios = [], []
+
+        if videos and audios:
+            LOGGER.info(
+                f"[VT] auto-mux: {len(videos)} video(s) × {len(audios)} audio(s) "
+                f"in {work_dir} — running Quick Mux without menu"
+            )
+            outputs: list[str] = []
+            # Pair videos[i] with audios[i] (round-robin), same as Merge V+A.
+            for i, v in enumerate(videos):
+                a = audios[i % len(audios)]
+                out = await op_merge_video_audio(v, a, lang="und")
+                if out:
+                    outputs.append(out)
+
+            if outputs:
+                # Build a synthetic session so _handoff_to_listener can update
+                # listener.name/dir and re-enter the upload pipeline.
+                session = {
+                    "user_id": getattr(listener, "user_id", 0),
+                    "work_dir": work_dir,
+                    "multi": multi,
+                    "rename": "",  # C1: no rename for merge
+                    "listener": listener,
+                    "created_at": time.time(),
+                }
+                try:
+                    await send_message(
+                        listener.message,
+                        (
+                            "✅ **Auto-Mux** complete (Video + Audio)\n"
+                            f"📁 Produced **{len(outputs)}** file(s).\n"
+                            "_Set `VT_AUTO_MUX=False` to disable this fast path._"
+                        ),
+                    )
+                except Exception:
+                    pass
+                await _handoff_to_listener(session, outputs)
+                return
+            # If outputs is empty, fall through to the menu so the user
+            # can pick a different op or retry. Better than a silent fail.
+            LOGGER.warning("[VT] auto-mux produced no outputs; falling back to menu")
 
     await _open_video_tools_menu(
         listener.message,

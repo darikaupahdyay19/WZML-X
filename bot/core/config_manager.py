@@ -104,6 +104,12 @@ class Config:
     TG_PROXY = None
     THUMBNAIL_LAYOUT = ""
     VERIFY_TIMEOUT = 0
+    # Video Tools (-vt) auto-mux behaviour. When True (default), passing
+    # `-vt -m` to /mirror or /leech will automatically soft-mux the first
+    # external audio file into the first video file as soon as the download
+    # finishes, and skip the inline-keyboard menu. Set to False to always
+    # force the picker even with one V + one A in the work-dir.
+    VT_AUTO_MUX = True
     LOGIN_PASS = ""
     TORRENT_TIMEOUT = 0
     TIMEZONE = "Asia/Kolkata"
