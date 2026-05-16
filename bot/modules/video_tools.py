@@ -283,39 +283,54 @@ def _user_alert(query, text: str, show: bool = True) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def build_video_tools_keyboard(session_id: int) -> Any:
+def build_video_tools_keyboard(
+    session_id: int,
+    inventory: dict | None = None,
+) -> Any:
     """Build the inline keyboard for the video tools menu.
 
-    Layout (organised rows):
-
-        Row 1 — Merge V+V        | Merge V+A
-        Row 2 — Merge V+S        | Hardsub (sudo)
-        Row 3 — SubSync          | Compress (HEVC)
-        Row 4 — Trim             | Watermark
-        Row 5 — Remove Video     | Extract Video
-        Row 6 — Custom Extract   | Convert (Resize)
-        Footer — Cancel
+    ``inventory`` is an optional dict with integer counts for ``videos``,
+    ``audios``, ``subs``, ``images``. When provided, buttons whose required
+    inputs aren't present in the work-dir are omitted entirely so users can
+    only pick operations that actually have something to chew on. When
+    ``inventory`` is None (legacy call site), every button renders.
     """
+    inv = inventory or {}
+    n_videos = int(inv.get("videos", 1)) if inventory is not None else 1
+    n_audios = int(inv.get("audios", 1)) if inventory is not None else 1
+    n_subs   = int(inv.get("subs",   1)) if inventory is not None else 1
+
     buttons = ButtonMaker()
 
     s = session_id
 
-    buttons.data_button("🎬 Merge Video+Video", f"{CALLBACK_PREFIX} {s} {OP_MERGE_VV}")
-    buttons.data_button("🔊 Merge Video+Audio", f"{CALLBACK_PREFIX} {s} {OP_MERGE_VA}")
+    # Merge V+V needs ≥2 videos; everything else only needs the video itself.
+    if n_videos >= 2:
+        buttons.data_button(
+            "🎬 Merge Video+Video", f"{CALLBACK_PREFIX} {s} {OP_MERGE_VV}"
+        )
 
-    buttons.data_button("⚡ Quick Mux (V+A, no prompt)", f"{CALLBACK_PREFIX} {s} {OP_QUICK_MUX}")
-    buttons.data_button("📝 Merge Video+Subtitle", f"{CALLBACK_PREFIX} {s} {OP_MERGE_VS}")
-    buttons.data_button("🔥 Hardsub (sudo)", f"{CALLBACK_PREFIX} {s} {OP_HARDSUB}")
+    if n_audios >= 1:
+        buttons.data_button(
+            "🔊 Merge Video+Audio", f"{CALLBACK_PREFIX} {s} {OP_MERGE_VA}"
+        )
+        buttons.data_button(
+            "⚡ Quick Mux (V+A, no prompt)", f"{CALLBACK_PREFIX} {s} {OP_QUICK_MUX}"
+        )
 
-    buttons.data_button("⏱️ SubSync", f"{CALLBACK_PREFIX} {s} {OP_SUBSYNC}")
+    if n_subs >= 1:
+        buttons.data_button(
+            "📝 Merge Video+Subtitle", f"{CALLBACK_PREFIX} {s} {OP_MERGE_VS}"
+        )
+        buttons.data_button("🔥 Hardsub (sudo)", f"{CALLBACK_PREFIX} {s} {OP_HARDSUB}")
+        buttons.data_button("⏱️ SubSync", f"{CALLBACK_PREFIX} {s} {OP_SUBSYNC}")
+
+    # Always-on ops (only need the video itself).
     buttons.data_button("📦 Compress (HEVC CRF28)", f"{CALLBACK_PREFIX} {s} {OP_COMPRESS}")
-
     buttons.data_button("✂️ Trim", f"{CALLBACK_PREFIX} {s} {OP_TRIM}")
     buttons.data_button("💧 Watermark", f"{CALLBACK_PREFIX} {s} {OP_WATERMARK}")
-
     buttons.data_button("🔇 Remove Video Stream", f"{CALLBACK_PREFIX} {s} {OP_REMOVE_VID}")
     buttons.data_button("🎞️ Extract Video Stream", f"{CALLBACK_PREFIX} {s} {OP_EXTRACT_VID}")
-
     buttons.data_button("🎯 Custom Extract Streams", f"{CALLBACK_PREFIX} {s} {OP_CUSTOM_EX}")
     buttons.data_button("🔁 Convert (Resize)", f"{CALLBACK_PREFIX} {s} {OP_CONVERT}")
 
@@ -1397,16 +1412,37 @@ async def _open_video_tools_menu(
     audios_count = len(await find_audios(work_dir))
     subs_count = len(await find_subs(work_dir))
 
+    # Inventory drives which buttons are even visible — we hide ops whose
+    # required inputs aren't present so users never tap a button that's
+    # going to "❌ requires at least one external audio file".
+    inventory = {
+        "videos": len(videos),
+        "audios": audios_count,
+        "subs": subs_count,
+    }
+
+    # Surface a friendly hint when the inventory is video-only — that's the
+    # case where a user expecting Merge V+A would otherwise get a confusing
+    # button-vanished UI.
+    if audios_count == 0 and subs_count == 0:
+        hint = (
+            "\n_Only video found. To mux audio/subs, send the audio or subtitle "
+            "in the **same task** (e.g. `-i 2 -vt` then reply with both files / links)._"
+        )
+    else:
+        hint = ""
+
     sent = await send_message(
         message,
         (
             "🛠 **Video Tools (-vt)**\n"
             f"📂 Dir: `{work_dir}`\n"
             f"🎞 Videos: **{len(videos)}**  ·  🔊 Audios: **{audios_count}**  ·  📝 Subs: **{subs_count}**\n"
-            f"✏️ Rename (-n): **{rename or '—'}**\n\n"
+            f"✏️ Rename (-n): **{rename or '—'}**"
+            f"{hint}\n\n"
             "Choose an operation:"
         ),
-        buttons=build_video_tools_keyboard(0),  # placeholder, replaced below
+        buttons=build_video_tools_keyboard(0, inventory),  # placeholder, replaced below
     )
 
     # Replace the keyboard now that we know the message-id used as session key.
@@ -1419,12 +1455,15 @@ async def _open_video_tools_menu(
             "rename": rename,
             "listener": listener,
             "created_at": time.time(),
+            # Cache the inventory so the back-button can re-render the same
+            # availability-aware keyboard without re-scanning the work-dir.
+            "inventory": inventory,
         }
         await edit_message(
             sent,
             sent.text.markdown if hasattr(sent.text, "markdown") else
             (sent.text or "🛠 Video Tools"),
-            buttons=build_video_tools_keyboard(sent.id),
+            buttons=build_video_tools_keyboard(sent.id, inventory),
         )
 
 
@@ -1563,7 +1602,9 @@ async def video_tools_callback(client, query):
             query.message.text.markdown
             if hasattr(query.message.text, "markdown")
             else (query.message.text or ""),
-            buttons=build_video_tools_keyboard(session_id),
+            buttons=build_video_tools_keyboard(
+                session_id, session.get("inventory")
+            ),
         )
         await query.answer()
         return
