@@ -101,6 +101,13 @@ OP_WATERMARK  = "wmk"
 OP_REMOVE_VID = "rmv"   # extract audio only (mute video → audio)
 OP_EXTRACT_VID = "exv"  # extract video only (no audio)
 OP_CONVERT    = "cvt"
+OP_CUSTOM_EX  = "cex"   # custom multi-stream extraction
+
+# Sub-actions for the custom-extract sub-menu
+CEX_TOGGLE = "cextog"   # toggle a single stream selection
+CEX_RUN    = "cexrun"   # run extraction with the current selection
+CEX_ALL    = "cexall"   # select all streams of a kind ("a" / "s" / "v")
+CEX_NONE   = "cexnone"  # clear selection
 
 MERGE_OPS = {OP_MERGE_VV, OP_MERGE_VA, OP_MERGE_VS}
 INHERITED_OPS = {OP_TRIM, OP_WATERMARK, OP_REMOVE_VID, OP_EXTRACT_VID, OP_CONVERT}
@@ -245,7 +252,7 @@ def _user_alert(query, text: str, show: bool = True) -> Any:
 
 
 def build_video_tools_keyboard(session_id: int) -> Any:
-    """Build the 11-button inline keyboard for the video tools menu.
+    """Build the inline keyboard for the video tools menu.
 
     Layout (organised rows):
 
@@ -254,8 +261,8 @@ def build_video_tools_keyboard(session_id: int) -> Any:
         Row 3 — SubSync          | Compress (HEVC)
         Row 4 — Trim             | Watermark
         Row 5 — Remove Video     | Extract Video
-        Row 6 — Convert (Resize) ▼
-        Row 7 — Cancel
+        Row 6 — Custom Extract   | Convert (Resize)
+        Footer — Cancel
     """
     buttons = ButtonMaker()
 
@@ -276,6 +283,7 @@ def build_video_tools_keyboard(session_id: int) -> Any:
     buttons.data_button("🔇 Remove Video Stream", f"{CALLBACK_PREFIX} {s} {OP_REMOVE_VID}")
     buttons.data_button("🎞️ Extract Video Stream", f"{CALLBACK_PREFIX} {s} {OP_EXTRACT_VID}")
 
+    buttons.data_button("🎯 Custom Extract Streams", f"{CALLBACK_PREFIX} {s} {OP_CUSTOM_EX}")
     buttons.data_button("🔁 Convert (Resize)", f"{CALLBACK_PREFIX} {s} {OP_CONVERT}")
 
     buttons.data_button("❌ Cancel", f"{CALLBACK_PREFIX} {s} cancel", "footer")
@@ -493,6 +501,165 @@ async def op_convert_resolution(video: str, label: str) -> str | None:
     )
     rc, _, _ = await run_ffmpeg(cmd)
     return out_path if rc == 0 else None
+
+
+# ---------------------------------------------------------------------------
+# 12) Custom multi-stream extraction
+# ---------------------------------------------------------------------------
+
+
+def _stream_label(stream: dict) -> str:
+    """Render a one-liner for an ffprobe stream dict.
+
+    Format::  [V|A|S] #idx · codec · lang · title
+    """
+    kind_map = {"video": "V", "audio": "A", "subtitle": "S"}
+    kind = kind_map.get(stream.get("codec_type"), "?")
+    idx = stream.get("index", "?")
+    codec = stream.get("codec_name") or "?"
+    tags = stream.get("tags") or {}
+    lang = tags.get("language") or tags.get("LANGUAGE") or "und"
+    title = tags.get("title") or tags.get("TITLE") or ""
+
+    extra: list[str] = []
+    if kind == "V":
+        w, h = stream.get("width"), stream.get("height")
+        if w and h:
+            extra.append(f"{w}x{h}")
+    elif kind == "A":
+        ch = stream.get("channels")
+        if ch:
+            extra.append(f"{ch}ch")
+    extras = " · " + " ".join(extra) if extra else ""
+
+    title_part = f" · {title[:40]}" if title else ""
+    return f"[{kind}] #{idx} · {codec} · {lang}{extras}{title_part}"
+
+
+async def list_streams(video: str) -> list[dict]:
+    """Return all streams of the given video file via ffprobe."""
+    meta = await probe_video(video)
+    streams: list[dict] = []
+    for s in meta.get("streams", []):
+        if s.get("codec_type") in ("video", "audio", "subtitle"):
+            streams.append(s)
+    return streams
+
+
+def _ext_for_stream(stream: dict) -> str:
+    """Best-effort container/extension for a single extracted stream."""
+    kind = stream.get("codec_type")
+    codec = (stream.get("codec_name") or "").lower()
+    if kind == "video":
+        return {
+            "h264": ".h264", "hevc": ".hevc", "h265": ".h265",
+            "av1": ".av1", "vp9": ".webm", "vp8": ".webm",
+        }.get(codec, ".mkv")
+    if kind == "audio":
+        return {
+            "aac": ".m4a", "mp3": ".mp3", "flac": ".flac",
+            "opus": ".opus", "vorbis": ".ogg", "ac3": ".ac3",
+            "eac3": ".eac3", "dts": ".dts", "alac": ".m4a",
+            "pcm_s16le": ".wav", "pcm_s24le": ".wav",
+        }.get(codec, ".mka")
+    # subtitle
+    return {
+        "subrip": ".srt", "srt": ".srt", "ass": ".ass", "ssa": ".ssa",
+        "webvtt": ".vtt", "mov_text": ".srt", "hdmv_pgs_subtitle": ".sup",
+        "dvd_subtitle": ".sub",
+    }.get(codec, ".mks")
+
+
+async def op_custom_extract(
+    video: str, stream_indexes: list[int], all_streams: list[dict]
+) -> list[str]:
+    """12) Extract one file per selected stream, preserving codec when possible.
+
+    `stream_indexes` are absolute stream indexes from ffprobe (the values
+    that sit in ``stream["index"]`` and that ffmpeg accepts after ``-map 0:``).
+    """
+    by_index = {int(s["index"]): s for s in all_streams}
+    base = ospath.splitext(video)[0]
+    outputs: list[str] = []
+
+    for idx in stream_indexes:
+        s = by_index.get(int(idx))
+        if not s:
+            continue
+        kind = s.get("codec_type", "?")
+        tags = s.get("tags") or {}
+        lang = tags.get("language") or tags.get("LANGUAGE") or "und"
+        ext = _ext_for_stream(s)
+        # e.g. movie.s2.eng.srt or movie.a3.jpn.m4a
+        suffix = f"{kind[:1]}{idx}.{lang}"
+        out_path = f"{base}.{suffix}{ext}"
+
+        # Subtitle text codecs need an explicit codec when going to .srt/.ass
+        sub_codec = ""
+        if kind == "subtitle":
+            target = ext.lstrip(".")
+            sub_codec = {
+                "srt": " -c:s srt",
+                "ass": " -c:s ass",
+                "ssa": " -c:s ass",
+                "vtt": " -c:s webvtt",
+            }.get(target, " -c:s copy")
+
+        cmd = (
+            f"{_ffmpeg()} -hide_banner -loglevel error -y "
+            f"-i {shlex.quote(video)} -map 0:{int(idx)} "
+            f"-c copy{sub_codec} {shlex.quote(out_path)}"
+        )
+        rc, _, _ = await run_ffmpeg(cmd)
+        if rc == 0:
+            outputs.append(out_path)
+        else:
+            # Last-ditch retry without -c copy for tricky containers.
+            retry = (
+                f"{_ffmpeg()} -hide_banner -loglevel error -y "
+                f"-i {shlex.quote(video)} -map 0:{int(idx)} "
+                f"{shlex.quote(out_path)}"
+            )
+            rc2, _, _ = await run_ffmpeg(retry)
+            if rc2 == 0:
+                outputs.append(out_path)
+    return outputs
+
+
+def build_custom_extract_keyboard(
+    session_id: int, streams: list[dict], selected: set[int]
+) -> Any:
+    """Build the toggleable stream-picker keyboard.
+
+    Each stream gets one button labelled with kind/codec/lang and prefixed by
+    a check-mark when selected. Footer rows offer All-Audio / All-Subs /
+    Clear and the Run / Back actions.
+    """
+    buttons = ButtonMaker()
+
+    for s in streams:
+        idx = int(s["index"])
+        prefix = "✅ " if idx in selected else "▫️ "
+        # callback: vt <sid> cextog <stream_idx>
+        buttons.data_button(
+            prefix + _stream_label(s),
+            f"{CALLBACK_PREFIX} {session_id} {CEX_TOGGLE} {idx}",
+        )
+
+    # Bulk helpers (l_body row, 3 across)
+    buttons.data_button("🔊 All Audio", f"{CALLBACK_PREFIX} {session_id} {CEX_ALL} a", "l_body")
+    buttons.data_button("📝 All Subtitles", f"{CALLBACK_PREFIX} {session_id} {CEX_ALL} s", "l_body")
+    buttons.data_button("🧹 Clear", f"{CALLBACK_PREFIX} {session_id} {CEX_NONE}", "l_body")
+
+    # Action row
+    buttons.data_button(
+        f"⚡ Extract Selected ({len(selected)})",
+        f"{CALLBACK_PREFIX} {session_id} {CEX_RUN}",
+        "footer",
+    )
+    buttons.data_button("⬅️ Back", f"{CALLBACK_PREFIX} {session_id} back", "footer")
+
+    return buttons.build_menu(b_cols=1, lb_cols=3, f_cols=2)
 
 
 # ---------------------------------------------------------------------------
@@ -916,6 +1083,133 @@ async def video_tools_callback(client, query):
             buttons=build_video_tools_keyboard(session_id),
         )
         await query.answer()
+        return
+
+    # ---- Custom Extract sub-flow ----------------------------------------
+    # First click opens the picker; subsequent clicks toggle / run / clear.
+    if op == OP_CUSTOM_EX:
+        videos = await find_videos(session["work_dir"])
+        if not videos:
+            await query.answer("No videos found.", show_alert=True)
+            return
+        target = videos[0]  # C3: probe and apply against the first video
+        streams = await list_streams(target)
+        if not streams:
+            await query.answer(
+                "ffprobe found no V/A/S streams in the file.", show_alert=True
+            )
+            return
+        session["cex_target"] = target
+        session["cex_streams"] = streams
+        session["cex_selected"] = set()
+        await edit_message(
+            query.message,
+            (
+                "🎯 **Custom Extract Streams**\n"
+                f"📄 File: `{ospath.basename(target)}`\n"
+                f"🎚 Streams found: **{len(streams)}**\n\n"
+                "Tap a stream to toggle, then **⚡ Extract Selected**.\n"
+                "Format: `[V|A|S] #idx · codec · lang · WxH/ch · title`"
+            ),
+            buttons=build_custom_extract_keyboard(
+                session_id, streams, session["cex_selected"]
+            ),
+        )
+        await query.answer()
+        return
+
+    if op == CEX_TOGGLE:
+        if "cex_streams" not in session:
+            await query.answer("Re-open Custom Extract.", show_alert=True)
+            return
+        try:
+            idx = int(data[3])
+        except (IndexError, ValueError):
+            await query.answer("Bad stream index.", show_alert=True)
+            return
+        sel: set[int] = session["cex_selected"]
+        sel.discard(idx) if idx in sel else sel.add(idx)
+        await edit_message(
+            query.message,
+            query.message.text.markdown
+            if hasattr(query.message.text, "markdown")
+            else (query.message.text or ""),
+            buttons=build_custom_extract_keyboard(
+                session_id, session["cex_streams"], sel
+            ),
+        )
+        await query.answer(f"{len(sel)} selected")
+        return
+
+    if op == CEX_ALL:
+        kind = data[3] if len(data) > 3 else ""
+        kind_map = {"v": "video", "a": "audio", "s": "subtitle"}
+        if kind not in kind_map or "cex_streams" not in session:
+            await query.answer()
+            return
+        target_kind = kind_map[kind]
+        for s in session["cex_streams"]:
+            if s.get("codec_type") == target_kind:
+                session["cex_selected"].add(int(s["index"]))
+        await edit_message(
+            query.message,
+            query.message.text.markdown
+            if hasattr(query.message.text, "markdown")
+            else (query.message.text or ""),
+            buttons=build_custom_extract_keyboard(
+                session_id, session["cex_streams"], session["cex_selected"]
+            ),
+        )
+        await query.answer(f"{len(session['cex_selected'])} selected")
+        return
+
+    if op == CEX_NONE:
+        if "cex_streams" not in session:
+            await query.answer()
+            return
+        session["cex_selected"] = set()
+        await edit_message(
+            query.message,
+            query.message.text.markdown
+            if hasattr(query.message.text, "markdown")
+            else (query.message.text or ""),
+            buttons=build_custom_extract_keyboard(
+                session_id, session["cex_streams"], session["cex_selected"]
+            ),
+        )
+        await query.answer("Cleared")
+        return
+
+    if op == CEX_RUN:
+        sel = session.get("cex_selected") or set()
+        if not sel:
+            await query.answer("Pick at least one stream first.", show_alert=True)
+            return
+        target = session["cex_target"]
+        streams = session["cex_streams"]
+        await edit_message(
+            query.message,
+            f"⏳ Extracting {len(sel)} stream(s) from `{ospath.basename(target)}` …",
+            buttons=None,
+        )
+        await query.answer("Started")
+        outputs = await op_custom_extract(target, sorted(sel), streams)
+        if not outputs:
+            await edit_message(
+                query.message,
+                "❌ No streams were extracted. Check the bot log for ffmpeg errors.",
+            )
+            return
+        listing = "\n".join(f"• `{ospath.basename(o)}`" for o in outputs)
+        await edit_message(
+            query.message,
+            f"✅ Extracted {len(outputs)} stream(s):\n{listing}",
+        )
+        # Clear the per-flow state and hand off for upload.
+        for k in ("cex_target", "cex_streams", "cex_selected"):
+            session.pop(k, None)
+        await _handoff_to_listener(session, outputs)
+        VT_SESSIONS.pop(session_id, None)
         return
 
     # Convert opens a sub-menu first; the resolution comes back as "cvt:1080p".
