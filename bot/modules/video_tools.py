@@ -39,13 +39,15 @@ Output:
 
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 import shlex
 import time
 from asyncio import create_subprocess_shell, gather
 from asyncio.subprocess import PIPE
 from os import path as ospath, walk
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from aiofiles.os import listdir, makedirs
 from aiofiles.os import path as aiopath
@@ -87,6 +89,27 @@ RESOLUTION_MAP = {
     "360p":  (640, 360),
 }
 
+# Common ISO 639-2/B (3-letter) language codes used for Merge V+A and V+S
+# metadata tagging. The flag emoji is purely cosmetic on the button.
+COMMON_LANGS: list[tuple[str, str, str]] = [
+    ("🇬🇧", "eng", "English"),
+    ("🇯🇵", "jpn", "Japanese"),
+    ("🇮🇳", "hin", "Hindi"),
+    ("🇧🇩", "ben", "Bengali"),
+    ("🇪🇸", "spa", "Spanish"),
+    ("🇫🇷", "fre", "French"),
+    ("🇩🇪", "ger", "German"),
+    ("🇨🇳", "chi", "Chinese"),
+    ("🇰🇷", "kor", "Korean"),
+    ("🇷🇺", "rus", "Russian"),
+    ("🇸🇦", "ara", "Arabic"),
+    ("🇵🇹", "por", "Portuguese"),
+    ("🇮🇹", "ita", "Italian"),
+    ("🇹🇷", "tur", "Turkish"),
+    ("🇮🇩", "ind", "Indonesian"),
+    ("🇹🇭", "tha", "Thai"),
+]
+
 CALLBACK_PREFIX = "vt"
 
 # Operation codes used in callback_data and routing
@@ -101,6 +124,21 @@ OP_WATERMARK  = "wmk"
 OP_REMOVE_VID = "rmv"   # extract audio only (mute video → audio)
 OP_EXTRACT_VID = "exv"  # extract video only (no audio)
 OP_CONVERT    = "cvt"
+OP_CUSTOM_EX  = "cex"   # custom multi-stream extraction
+
+# Sub-actions for the custom-extract sub-menu
+CEX_TOGGLE = "cextog"   # toggle a single stream selection
+CEX_RUN    = "cexrun"   # run extraction with the current selection
+CEX_ALL    = "cexall"   # select all streams of a kind ("a" / "s" / "v")
+CEX_NONE   = "cexnone"  # clear selection
+
+# Sub-actions for the merge-V+A / V+S language picker
+MRG_LANG = "mlang"     # user picked a language for the merge op
+
+# Sub-actions for the interactive Trim flow
+TRM_PRESET = "trmpre"   # quick preset (e.g. trmpre:0:60)
+TRM_INPUT  = "trminp"   # user is sending custom timestamps as a chat reply
+TRM_CANCEL = "trmcan"   # cancel a running trim job
 
 MERGE_OPS = {OP_MERGE_VV, OP_MERGE_VA, OP_MERGE_VS}
 INHERITED_OPS = {OP_TRIM, OP_WATERMARK, OP_REMOVE_VID, OP_EXTRACT_VID, OP_CONVERT}
@@ -245,7 +283,7 @@ def _user_alert(query, text: str, show: bool = True) -> Any:
 
 
 def build_video_tools_keyboard(session_id: int) -> Any:
-    """Build the 11-button inline keyboard for the video tools menu.
+    """Build the inline keyboard for the video tools menu.
 
     Layout (organised rows):
 
@@ -254,8 +292,8 @@ def build_video_tools_keyboard(session_id: int) -> Any:
         Row 3 — SubSync          | Compress (HEVC)
         Row 4 — Trim             | Watermark
         Row 5 — Remove Video     | Extract Video
-        Row 6 — Convert (Resize) ▼
-        Row 7 — Cancel
+        Row 6 — Custom Extract   | Convert (Resize)
+        Footer — Cancel
     """
     buttons = ButtonMaker()
 
@@ -276,6 +314,7 @@ def build_video_tools_keyboard(session_id: int) -> Any:
     buttons.data_button("🔇 Remove Video Stream", f"{CALLBACK_PREFIX} {s} {OP_REMOVE_VID}")
     buttons.data_button("🎞️ Extract Video Stream", f"{CALLBACK_PREFIX} {s} {OP_EXTRACT_VID}")
 
+    buttons.data_button("🎯 Custom Extract Streams", f"{CALLBACK_PREFIX} {s} {OP_CUSTOM_EX}")
     buttons.data_button("🔁 Convert (Resize)", f"{CALLBACK_PREFIX} {s} {OP_CONVERT}")
 
     buttons.data_button("❌ Cancel", f"{CALLBACK_PREFIX} {s} cancel", "footer")
@@ -292,6 +331,273 @@ def build_resolution_keyboard(session_id: int) -> Any:
         )
     buttons.data_button("⬅️ Back", f"{CALLBACK_PREFIX} {session_id} back")
     return buttons.build_menu(2)
+
+
+def build_merge_lang_keyboard(session_id: int, op: str) -> Any:
+    """Pick a language tag for the upcoming Merge V+A or V+S operation.
+
+    The chosen ISO-639-2 code travels through the callback as the ``extra``
+    component, e.g. ``vt <sid> mlang:mva:eng`` or ``…:mvs:jpn``.  Picking
+    "Skip" sends an empty extra so the merge runs with ``language=und``.
+    """
+    buttons = ButtonMaker()
+    for flag, code, name in COMMON_LANGS:
+        buttons.data_button(
+            f"{flag} {name}",
+            f"{CALLBACK_PREFIX} {session_id} {MRG_LANG}:{op}:{code}",
+        )
+    buttons.data_button(
+        "🌐 Undefined (skip)",
+        f"{CALLBACK_PREFIX} {session_id} {MRG_LANG}:{op}:und",
+        "footer",
+    )
+    buttons.data_button("⬅️ Back", f"{CALLBACK_PREFIX} {session_id} back", "footer")
+    return buttons.build_menu(b_cols=2, f_cols=2)
+
+
+# ---------------------------------------------------------------------------
+# Trim picker + progress reporting + cancellable ffmpeg runner
+# ---------------------------------------------------------------------------
+
+
+# Per-session state used while a long-running trim (or any future cancellable
+# op) is in flight. Keys:
+#   "trim_proc"    -> asyncio subprocess handle (for terminate)
+#   "trim_cancel"  -> asyncio.Event flagged when user taps Cancel
+#   "trim_total"   -> source duration in seconds (for % progress)
+#   "trim_msg"     -> the bot message we're updating
+TRIM_PRESETS: list[tuple[str, str]] = [
+    # (button label, "start-end" in HH:MM:SS)
+    ("🎯 First 30s",   "00:00:00-00:00:30"),
+    ("🎯 First 1 min", "00:00:00-00:01:00"),
+    ("🎯 First 5 min", "00:00:00-00:05:00"),
+    ("⏯️ 0:00 → 10:00", "00:00:00-00:10:00"),
+    ("⏯️ 1:00 → 5:00",  "00:01:00-00:05:00"),
+]
+
+
+def build_trim_keyboard(session_id: int) -> Any:
+    """Sub-menu for the Trim action.
+
+    Top body: quick presets (one row per preset).
+    l_body: a "Custom range…" prompt (cancelled by Back).
+    Footer: Back.
+    """
+    buttons = ButtonMaker()
+    for label, ts in TRIM_PRESETS:
+        # callback: ``vt <sid> trmpre:00:00:00-00:00:30``
+        buttons.data_button(
+            label,
+            f"{CALLBACK_PREFIX} {session_id} {TRM_PRESET}:{ts}",
+        )
+    buttons.data_button(
+        "✏️ Custom range (reply with HH:MM:SS-HH:MM:SS)",
+        f"{CALLBACK_PREFIX} {session_id} {TRM_INPUT}",
+        "l_body",
+    )
+    buttons.data_button("⬅️ Back", f"{CALLBACK_PREFIX} {session_id} back", "footer")
+    return buttons.build_menu(b_cols=1, lb_cols=1, f_cols=1)
+
+
+def build_progress_keyboard(session_id: int) -> Any:
+    """A single 'Terminate' button shown next to a progress bar."""
+    buttons = ButtonMaker()
+    buttons.data_button(
+        "🛑 Terminate",
+        f"{CALLBACK_PREFIX} {session_id} {TRM_CANCEL}",
+        "footer",
+    )
+    return buttons.build_menu(f_cols=1)
+
+
+def _hms_to_seconds(ts: str) -> float | None:
+    """Parse HH:MM:SS(.ms) or MM:SS or seconds → float seconds (or None)."""
+    ts = ts.strip()
+    if not ts:
+        return None
+    try:
+        if ":" not in ts:
+            return float(ts)
+        parts = ts.split(":")
+        if len(parts) == 2:
+            m, s = parts
+            return int(m) * 60 + float(s)
+        if len(parts) == 3:
+            h, m, s = parts
+            return int(h) * 3600 + int(m) * 60 + float(s)
+    except ValueError:
+        return None
+    return None
+
+
+def _seconds_to_hms(secs: float) -> str:
+    secs = max(0.0, float(secs))
+    h = int(secs // 3600)
+    m = int((secs % 3600) // 60)
+    s = secs - h * 3600 - m * 60
+    return f"{h:02d}:{m:02d}:{s:06.3f}"
+
+
+def _progress_bar(pct: float, width: int = 18) -> str:
+    pct = max(0.0, min(100.0, pct))
+    filled = int(round(pct / 100.0 * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+_FFMPEG_TIME_RE = re.compile(r"out_time_ms=(\d+)")
+
+
+async def run_ffmpeg_with_progress(
+    cmd: str,
+    duration_sec: float,
+    on_progress: Callable[[float, float], Awaitable[None]],
+    cancel_event: asyncio.Event,
+) -> tuple[int, str]:
+    """Run ``cmd`` (an ffmpeg command string), parse ``-progress pipe:1`` output
+    on stdout, call ``on_progress(elapsed_sec, pct)`` for live updates, and
+    terminate the process if ``cancel_event`` is set.
+
+    The caller must include ``-progress pipe:1 -nostats`` in ``cmd`` so ffmpeg
+    emits machine-parsable lines like ``out_time_ms=1234567`` every ~500 ms.
+
+    Returns ``(returncode, last_stderr_tail)``.
+    """
+    LOGGER.info(f"[VT] FFmpeg(progress) → {cmd}")
+    proc = await create_subprocess_shell(cmd, stdout=PIPE, stderr=PIPE)
+
+    last_pct = -1.0
+
+    async def _watch_cancel():
+        await cancel_event.wait()
+        if proc.returncode is None:
+            try:
+                proc.terminate()
+                # If terminate doesn't take effect quickly, escalate to kill.
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    proc.kill()
+            except ProcessLookupError:
+                pass
+
+    cancel_task = asyncio.create_task(_watch_cancel())
+
+    try:
+        assert proc.stdout is not None
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            text = line.decode(errors="ignore").strip()
+            if not text:
+                continue
+            m = _FFMPEG_TIME_RE.search(text)
+            if not m:
+                continue
+            elapsed = int(m.group(1)) / 1_000_000.0
+            pct = (elapsed / duration_sec * 100.0) if duration_sec > 0 else 0.0
+            # Throttle by integer-percent change to avoid edit_message spam.
+            if int(pct) != int(last_pct):
+                last_pct = pct
+                try:
+                    await on_progress(elapsed, pct)
+                except Exception as e:
+                    LOGGER.debug(f"[VT] progress callback dropped update: {e}")
+    finally:
+        cancel_task.cancel()
+        try:
+            await cancel_task
+        except (asyncio.CancelledError, BaseException):
+            pass
+
+    stderr_b = await proc.stderr.read() if proc.stderr else b""
+    rc = await proc.wait()
+    stderr_tail = stderr_b.decode(errors="ignore")[-800:] if stderr_b else ""
+    if rc != 0 and not cancel_event.is_set():
+        LOGGER.error(f"[VT] FFmpeg(progress) failed (rc={rc}): {stderr_tail}")
+    return rc, stderr_tail
+
+
+async def _await_user_text_reply(
+    client,
+    session: dict,
+    chat_id: int,
+    user_id: int,
+    timeout: float = 120.0,
+) -> str | None:
+    """Wait for a single text message from ``user_id`` in ``chat_id``.
+
+    Used by the Trim "custom range" flow. Returns the trimmed text, or None
+    on timeout / handler removal. The handler is removed exactly once,
+    whether the message arrives or not.
+    """
+    from pyrogram.handlers import MessageHandler as _MH
+    from pyrogram.filters import (
+        chat as _f_chat,
+        text as _f_text,
+        user as _f_user,
+    )
+
+    fut: asyncio.Future[str] = asyncio.get_event_loop().create_future()
+
+    async def _on_msg(_, message):
+        if not fut.done():
+            fut.set_result((message.text or "").strip())
+
+    handler = _MH(_on_msg, _f_chat(chat_id) & _f_user(user_id) & _f_text)
+    handler_id = client.add_handler(handler, group=-1)
+
+    try:
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+    finally:
+        try:
+            client.remove_handler(*handler_id)
+        except Exception:
+            pass
+
+
+async def op_trim_with_progress(
+    video: str,
+    start: str,
+    end: str,
+    *,
+    on_progress: Callable[[float, float], Awaitable[None]],
+    cancel_event: asyncio.Event,
+    register_proc: Callable[[Any], None] | None = None,
+) -> tuple[str | None, bool]:
+    """Cancellable trim with live progress.
+
+    Returns ``(out_path_or_None, was_cancelled)``.  When the user terminates,
+    the partial output file is removed before returning.
+    """
+    out_path = _output_path(video, "trimmed")
+    duration_sec = max(0.0, (_hms_to_seconds(end) or 0.0) - (_hms_to_seconds(start) or 0.0))
+
+    cmd = (
+        f"{_ffmpeg()} -hide_banner -loglevel error -y "
+        f"-i {shlex.quote(video)} -ss {shlex.quote(start)} -to {shlex.quote(end)} "
+        f"-c copy -progress pipe:1 -nostats "
+        f"{shlex.quote(out_path)}"
+    )
+
+    rc, _stderr = await run_ffmpeg_with_progress(
+        cmd, duration_sec, on_progress, cancel_event
+    )
+
+    cancelled = cancel_event.is_set()
+    if cancelled or rc != 0:
+        # Tidy up the partial file.
+        try:
+            if await aiopath.exists(out_path):
+                await remove(out_path)
+        except Exception as e:
+            LOGGER.debug(f"[VT] couldn't remove partial trim output: {e}")
+        return None, cancelled
+
+    return out_path, False
 
 
 # ---------------------------------------------------------------------------
@@ -320,27 +626,99 @@ async def op_merge_videos(videos: list[str], work_dir: str) -> str | None:
     return out_path if rc == 0 else None
 
 
-async def op_merge_video_audio(video: str, audio: str) -> str | None:
-    """2) Merge an external audio file with a video stream (copy both)."""
-    out_path = _output_path(video, "merged_audio")
+async def op_merge_video_audio(
+    video: str,
+    audio: str,
+    lang: str = "und",
+    title: str | None = None,
+) -> str | None:
+    """2) Merge an external audio file into the video container.
+
+    Behaviour:
+      * Output is forced to ``.mkv`` (Matroska is the only widely-deployed
+        container that copes with arbitrary codecs *and* attachments).
+      * **All** input-0 streams are kept (video, all existing audios, all
+        existing subs, all attachments / fonts) via ``-map 0``.
+      * The new audio is appended via ``-map 1:a:0`` and tagged with the
+        provided ISO-639-2 ``lang`` and a human-readable ``title`` (defaults
+        to the audio file's stem so the player picker stays useful).
+      * Codecs are copied — no re-encode.
+    """
+    out_path = _output_path(video, "merged_audio", ".mkv")
+    if not title:
+        title = ospath.splitext(ospath.basename(audio))[0]
+
+    # The new audio's index inside the *output* file is the count of
+    # input-0 streams that came before it. We don't know that without
+    # ffprobe, but ffmpeg's relative metadata syntax (``-metadata:s:a:N``
+    # where N is the audio-stream index in the output) handles the
+    # ordering for us. Tagging by output stream-type index is the most
+    # reliable choice.
     cmd = (
         f"{_ffmpeg()} -hide_banner -loglevel error -y "
         f"-i {shlex.quote(video)} -i {shlex.quote(audio)} "
-        f"-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -shortest "
+        f"-map 0 -map 1:a:0 -c copy "
+        f"-metadata:s:a:{{NEW_AUDIO}} language={shlex.quote(lang)} "
+        f"-metadata:s:a:{{NEW_AUDIO}} title={shlex.quote(title)} "
+        f"-disposition:a:{{NEW_AUDIO}} 0 "
         f"{shlex.quote(out_path)}"
     )
+    # Resolve the {NEW_AUDIO} placeholder to the index this new audio will
+    # occupy in the output file (= number of audios already in input 0).
+    meta = await probe_video(video)
+    existing_audios = sum(
+        1 for s in meta.get("streams", []) if s.get("codec_type") == "audio"
+    )
+    cmd = cmd.replace("{NEW_AUDIO}", str(existing_audios))
+
     rc, _, _ = await run_ffmpeg(cmd)
     return out_path if rc == 0 else None
 
 
-async def op_merge_video_subtitle(video: str, sub: str) -> str | None:
-    """3) Soft-mux subtitles (SRT/ASS) into an MKV container."""
+async def op_merge_video_subtitle(
+    video: str,
+    sub: str,
+    lang: str = "und",
+    title: str | None = None,
+) -> str | None:
+    """3) Soft-mux an external subtitle file into the video container.
+
+    Behaviour:
+      * Output is forced to ``.mkv`` so PGS / ASS / SRT / VTT all fit and
+        attachments survive.
+      * **All** input-0 streams are kept (video, all audios, all existing
+        subs, all attachments / fonts) via ``-map 0``.
+      * The new subtitle is appended via ``-map 1`` and tagged with the
+        provided ``lang`` and ``title``.
+      * The new subtitle's codec is copied; existing streams are left
+        untouched. SRT/ASS tag the new track for friendly player picking.
+    """
     out_path = _output_path(video, "softsub", ".mkv")
-    sub_codec = "ass" if ospath.splitext(sub)[1].lower() in {".ass", ".ssa"} else "srt"
+    if not title:
+        title = ospath.splitext(ospath.basename(sub))[0]
+
+    sub_ext = ospath.splitext(sub)[1].lower()
+    # We let ffmpeg auto-pick the subtitle codec on copy. It only needs an
+    # explicit ``-c:s`` when *trans-coding* between text formats; with -c
+    # copy the source is preserved verbatim.
+    sub_codec_flag = ""
+    if sub_ext in {".srt", ".vtt"}:
+        sub_codec_flag = " -c:s:0 srt"  # only the *new* sub stream
+    elif sub_ext in {".ass", ".ssa"}:
+        sub_codec_flag = " -c:s:0 ass"
+
+    meta = await probe_video(video)
+    existing_subs = sum(
+        1 for s in meta.get("streams", []) if s.get("codec_type") == "subtitle"
+    )
+
     cmd = (
         f"{_ffmpeg()} -hide_banner -loglevel error -y "
         f"-i {shlex.quote(video)} -i {shlex.quote(sub)} "
-        f"-map 0 -map 1 -c copy -c:s {sub_codec} "
+        f"-map 0 -map 1:0 -c copy{sub_codec_flag} "
+        f"-metadata:s:s:{existing_subs} language={shlex.quote(lang)} "
+        f"-metadata:s:s:{existing_subs} title={shlex.quote(title)} "
+        f"-disposition:s:{existing_subs} 0 "
         f"{shlex.quote(out_path)}"
     )
     rc, _, _ = await run_ffmpeg(cmd)
@@ -496,6 +874,165 @@ async def op_convert_resolution(video: str, label: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# 12) Custom multi-stream extraction
+# ---------------------------------------------------------------------------
+
+
+def _stream_label(stream: dict) -> str:
+    """Render a one-liner for an ffprobe stream dict.
+
+    Format::  [V|A|S] #idx · codec · lang · title
+    """
+    kind_map = {"video": "V", "audio": "A", "subtitle": "S"}
+    kind = kind_map.get(stream.get("codec_type"), "?")
+    idx = stream.get("index", "?")
+    codec = stream.get("codec_name") or "?"
+    tags = stream.get("tags") or {}
+    lang = tags.get("language") or tags.get("LANGUAGE") or "und"
+    title = tags.get("title") or tags.get("TITLE") or ""
+
+    extra: list[str] = []
+    if kind == "V":
+        w, h = stream.get("width"), stream.get("height")
+        if w and h:
+            extra.append(f"{w}x{h}")
+    elif kind == "A":
+        ch = stream.get("channels")
+        if ch:
+            extra.append(f"{ch}ch")
+    extras = " · " + " ".join(extra) if extra else ""
+
+    title_part = f" · {title[:40]}" if title else ""
+    return f"[{kind}] #{idx} · {codec} · {lang}{extras}{title_part}"
+
+
+async def list_streams(video: str) -> list[dict]:
+    """Return all streams of the given video file via ffprobe."""
+    meta = await probe_video(video)
+    streams: list[dict] = []
+    for s in meta.get("streams", []):
+        if s.get("codec_type") in ("video", "audio", "subtitle"):
+            streams.append(s)
+    return streams
+
+
+def _ext_for_stream(stream: dict) -> str:
+    """Best-effort container/extension for a single extracted stream."""
+    kind = stream.get("codec_type")
+    codec = (stream.get("codec_name") or "").lower()
+    if kind == "video":
+        return {
+            "h264": ".h264", "hevc": ".hevc", "h265": ".h265",
+            "av1": ".av1", "vp9": ".webm", "vp8": ".webm",
+        }.get(codec, ".mkv")
+    if kind == "audio":
+        return {
+            "aac": ".m4a", "mp3": ".mp3", "flac": ".flac",
+            "opus": ".opus", "vorbis": ".ogg", "ac3": ".ac3",
+            "eac3": ".eac3", "dts": ".dts", "alac": ".m4a",
+            "pcm_s16le": ".wav", "pcm_s24le": ".wav",
+        }.get(codec, ".mka")
+    # subtitle
+    return {
+        "subrip": ".srt", "srt": ".srt", "ass": ".ass", "ssa": ".ssa",
+        "webvtt": ".vtt", "mov_text": ".srt", "hdmv_pgs_subtitle": ".sup",
+        "dvd_subtitle": ".sub",
+    }.get(codec, ".mks")
+
+
+async def op_custom_extract(
+    video: str, stream_indexes: list[int], all_streams: list[dict]
+) -> list[str]:
+    """12) Extract one file per selected stream, preserving codec when possible.
+
+    `stream_indexes` are absolute stream indexes from ffprobe (the values
+    that sit in ``stream["index"]`` and that ffmpeg accepts after ``-map 0:``).
+    """
+    by_index = {int(s["index"]): s for s in all_streams}
+    base = ospath.splitext(video)[0]
+    outputs: list[str] = []
+
+    for idx in stream_indexes:
+        s = by_index.get(int(idx))
+        if not s:
+            continue
+        kind = s.get("codec_type", "?")
+        tags = s.get("tags") or {}
+        lang = tags.get("language") or tags.get("LANGUAGE") or "und"
+        ext = _ext_for_stream(s)
+        # e.g. movie.s2.eng.srt or movie.a3.jpn.m4a
+        suffix = f"{kind[:1]}{idx}.{lang}"
+        out_path = f"{base}.{suffix}{ext}"
+
+        # Subtitle text codecs need an explicit codec when going to .srt/.ass
+        sub_codec = ""
+        if kind == "subtitle":
+            target = ext.lstrip(".")
+            sub_codec = {
+                "srt": " -c:s srt",
+                "ass": " -c:s ass",
+                "ssa": " -c:s ass",
+                "vtt": " -c:s webvtt",
+            }.get(target, " -c:s copy")
+
+        cmd = (
+            f"{_ffmpeg()} -hide_banner -loglevel error -y "
+            f"-i {shlex.quote(video)} -map 0:{int(idx)} "
+            f"-c copy{sub_codec} {shlex.quote(out_path)}"
+        )
+        rc, _, _ = await run_ffmpeg(cmd)
+        if rc == 0:
+            outputs.append(out_path)
+        else:
+            # Last-ditch retry without -c copy for tricky containers.
+            retry = (
+                f"{_ffmpeg()} -hide_banner -loglevel error -y "
+                f"-i {shlex.quote(video)} -map 0:{int(idx)} "
+                f"{shlex.quote(out_path)}"
+            )
+            rc2, _, _ = await run_ffmpeg(retry)
+            if rc2 == 0:
+                outputs.append(out_path)
+    return outputs
+
+
+def build_custom_extract_keyboard(
+    session_id: int, streams: list[dict], selected: set[int]
+) -> Any:
+    """Build the toggleable stream-picker keyboard.
+
+    Each stream gets one button labelled with kind/codec/lang and prefixed by
+    a check-mark when selected. Footer rows offer All-Audio / All-Subs /
+    Clear and the Run / Back actions.
+    """
+    buttons = ButtonMaker()
+
+    for s in streams:
+        idx = int(s["index"])
+        prefix = "✅ " if idx in selected else "▫️ "
+        # callback: vt <sid> cextog <stream_idx>
+        buttons.data_button(
+            prefix + _stream_label(s),
+            f"{CALLBACK_PREFIX} {session_id} {CEX_TOGGLE} {idx}",
+        )
+
+    # Bulk helpers (l_body row, 3 across)
+    buttons.data_button("🔊 All Audio", f"{CALLBACK_PREFIX} {session_id} {CEX_ALL} a", "l_body")
+    buttons.data_button("📝 All Subtitles", f"{CALLBACK_PREFIX} {session_id} {CEX_ALL} s", "l_body")
+    buttons.data_button("🧹 Clear", f"{CALLBACK_PREFIX} {session_id} {CEX_NONE}", "l_body")
+
+    # Action row
+    buttons.data_button(
+        f"⚡ Extract Selected ({len(selected)})",
+        f"{CALLBACK_PREFIX} {session_id} {CEX_RUN}",
+        "footer",
+    )
+    buttons.data_button("⬅️ Back", f"{CALLBACK_PREFIX} {session_id} back", "footer")
+
+    return buttons.build_menu(b_cols=1, lb_cols=3, f_cols=2)
+
+
+# ---------------------------------------------------------------------------
 # Async file open helper (aiofiles is a hard dep elsewhere in the repo)
 # ---------------------------------------------------------------------------
 
@@ -644,10 +1181,13 @@ async def _process_op(session: dict, op: str, extra: str | None = None) -> tuple
         audios = await find_audios(work_dir)
         if not audios:
             return False, "Merge V+A requires at least one external audio file.", []
+        # `extra` arrives as the ISO 639-2 code picked from build_merge_lang_keyboard,
+        # or empty/None when invoked without a picker (defaults to "und").
+        lang = (extra or "und").strip() or "und"
         # With -m, pair videos[i] with audios[i] (round-robin). Without -m, just first.
         for i, v in enumerate(targets):
             a = audios[i % len(audios)]
-            out = await op_merge_video_audio(v, a)
+            out = await op_merge_video_audio(v, a, lang=lang)
             if out:
                 outputs.append(out)
 
@@ -656,9 +1196,10 @@ async def _process_op(session: dict, op: str, extra: str | None = None) -> tuple
         subs = await find_subs(work_dir)
         if not subs:
             return False, "Merge V+S requires at least one subtitle file.", []
+        lang = (extra or "und").strip() or "und"
         for i, v in enumerate(targets):
             s = subs[i % len(subs)]
-            out = await op_merge_video_subtitle(v, s)
+            out = await op_merge_video_subtitle(v, s, lang=lang)
             if out:
                 outputs.append(out)
 
@@ -874,6 +1415,102 @@ async def _open_video_tools_menu(
         )
 
 
+async def _run_trim_with_progress(
+    client,
+    progress_msg,
+    session: dict,
+    session_id: int,
+    video: str,
+    start: str,
+    end: str,
+) -> None:
+    """Drive a cancellable trim run end-to-end:
+
+      * Renders an initial progress message with a Terminate button.
+      * Streams ffmpeg ``-progress pipe:1`` updates and edits the message
+        every full % change (Telegram-friendly throttle).
+      * On cancel, the partial output is removed and the message is updated.
+      * On success, hands off to the listener for upload.
+    """
+    cancel_event = asyncio.Event()
+    session["trim_cancel"] = cancel_event
+
+    target_dur = max(0.0, (_hms_to_seconds(end) or 0.0) - (_hms_to_seconds(start) or 0.0))
+    started_at = time.time()
+    base_text = (
+        f"✂️ **Trim in progress**\n"
+        f"📄 `{ospath.basename(video)}`\n"
+        f"🎬 Range: `{start} → {end}`  (≈ {_seconds_to_hms(target_dur)})\n"
+    )
+
+    # First paint with 0%.
+    await edit_message(
+        progress_msg,
+        base_text + f"\n`{_progress_bar(0.0)}` **0.0%**\n_starting…_",
+        buttons=build_progress_keyboard(session_id),
+    )
+
+    # Throttle edits to roughly once a second too — even if % moves by 1.
+    last_edit_at = 0.0
+
+    async def _on_progress(elapsed: float, pct: float) -> None:
+        nonlocal last_edit_at
+        now = time.time()
+        if now - last_edit_at < 1.0 and pct < 99.0:
+            return
+        last_edit_at = now
+        eta_text = ""
+        if pct > 1.0:
+            wall = now - started_at
+            eta = max(0.0, wall * (100.0 - pct) / pct)
+            eta_text = f"  ·  ETA `{_seconds_to_hms(eta)}`"
+        try:
+            await edit_message(
+                progress_msg,
+                base_text
+                + f"\n`{_progress_bar(pct)}` **{pct:5.1f}%**"
+                + f"\nElapsed `{_seconds_to_hms(elapsed)}` / `{_seconds_to_hms(target_dur)}`"
+                + eta_text,
+                buttons=build_progress_keyboard(session_id),
+            )
+        except Exception as e:
+            LOGGER.debug(f"[VT] progress edit dropped: {e}")
+
+    try:
+        out_path, was_cancelled = await op_trim_with_progress(
+            video, start, end,
+            on_progress=_on_progress,
+            cancel_event=cancel_event,
+        )
+    finally:
+        session.pop("trim_cancel", None)
+
+    if was_cancelled:
+        await edit_message(
+            progress_msg,
+            base_text + "\n🛑 **Cancelled by user.** Partial output removed.",
+            buttons=None,
+        )
+        return
+    if not out_path:
+        await edit_message(
+            progress_msg,
+            base_text + "\n❌ FFmpeg failed. Check the bot log for details.",
+            buttons=None,
+        )
+        return
+
+    await edit_message(
+        progress_msg,
+        base_text
+        + f"\n`{_progress_bar(100.0)}` **100.0%**\n"
+        + f"✅ Trim complete → `{ospath.basename(out_path)}`",
+        buttons=None,
+    )
+    await _handoff_to_listener(session, [out_path])
+    VT_SESSIONS.pop(session_id, None)
+
+
 @new_task
 async def video_tools_callback(client, query):
     """CallbackQueryHandler entry point — routes button presses."""
@@ -918,6 +1555,133 @@ async def video_tools_callback(client, query):
         await query.answer()
         return
 
+    # ---- Custom Extract sub-flow ----------------------------------------
+    # First click opens the picker; subsequent clicks toggle / run / clear.
+    if op == OP_CUSTOM_EX:
+        videos = await find_videos(session["work_dir"])
+        if not videos:
+            await query.answer("No videos found.", show_alert=True)
+            return
+        target = videos[0]  # C3: probe and apply against the first video
+        streams = await list_streams(target)
+        if not streams:
+            await query.answer(
+                "ffprobe found no V/A/S streams in the file.", show_alert=True
+            )
+            return
+        session["cex_target"] = target
+        session["cex_streams"] = streams
+        session["cex_selected"] = set()
+        await edit_message(
+            query.message,
+            (
+                "🎯 **Custom Extract Streams**\n"
+                f"📄 File: `{ospath.basename(target)}`\n"
+                f"🎚 Streams found: **{len(streams)}**\n\n"
+                "Tap a stream to toggle, then **⚡ Extract Selected**.\n"
+                "Format: `[V|A|S] #idx · codec · lang · WxH/ch · title`"
+            ),
+            buttons=build_custom_extract_keyboard(
+                session_id, streams, session["cex_selected"]
+            ),
+        )
+        await query.answer()
+        return
+
+    if op == CEX_TOGGLE:
+        if "cex_streams" not in session:
+            await query.answer("Re-open Custom Extract.", show_alert=True)
+            return
+        try:
+            idx = int(data[3])
+        except (IndexError, ValueError):
+            await query.answer("Bad stream index.", show_alert=True)
+            return
+        sel: set[int] = session["cex_selected"]
+        sel.discard(idx) if idx in sel else sel.add(idx)
+        await edit_message(
+            query.message,
+            query.message.text.markdown
+            if hasattr(query.message.text, "markdown")
+            else (query.message.text or ""),
+            buttons=build_custom_extract_keyboard(
+                session_id, session["cex_streams"], sel
+            ),
+        )
+        await query.answer(f"{len(sel)} selected")
+        return
+
+    if op == CEX_ALL:
+        kind = data[3] if len(data) > 3 else ""
+        kind_map = {"v": "video", "a": "audio", "s": "subtitle"}
+        if kind not in kind_map or "cex_streams" not in session:
+            await query.answer()
+            return
+        target_kind = kind_map[kind]
+        for s in session["cex_streams"]:
+            if s.get("codec_type") == target_kind:
+                session["cex_selected"].add(int(s["index"]))
+        await edit_message(
+            query.message,
+            query.message.text.markdown
+            if hasattr(query.message.text, "markdown")
+            else (query.message.text or ""),
+            buttons=build_custom_extract_keyboard(
+                session_id, session["cex_streams"], session["cex_selected"]
+            ),
+        )
+        await query.answer(f"{len(session['cex_selected'])} selected")
+        return
+
+    if op == CEX_NONE:
+        if "cex_streams" not in session:
+            await query.answer()
+            return
+        session["cex_selected"] = set()
+        await edit_message(
+            query.message,
+            query.message.text.markdown
+            if hasattr(query.message.text, "markdown")
+            else (query.message.text or ""),
+            buttons=build_custom_extract_keyboard(
+                session_id, session["cex_streams"], session["cex_selected"]
+            ),
+        )
+        await query.answer("Cleared")
+        return
+
+    if op == CEX_RUN:
+        sel = session.get("cex_selected") or set()
+        if not sel:
+            await query.answer("Pick at least one stream first.", show_alert=True)
+            return
+        target = session["cex_target"]
+        streams = session["cex_streams"]
+        await edit_message(
+            query.message,
+            f"⏳ Extracting {len(sel)} stream(s) from `{ospath.basename(target)}` …",
+            buttons=None,
+        )
+        await query.answer("Started")
+        outputs = await op_custom_extract(target, sorted(sel), streams)
+        if not outputs:
+            await edit_message(
+                query.message,
+                "❌ No streams were extracted. Check the bot log for ffmpeg errors.",
+            )
+            return
+        listing = "\n".join(f"• `{ospath.basename(o)}`" for o in outputs)
+        await edit_message(
+            query.message,
+            f"✅ Extracted {len(outputs)} stream(s):\n{listing}",
+        )
+        # Clear the per-flow state and hand off for upload.
+        for k in ("cex_target", "cex_streams", "cex_selected"):
+            session.pop(k, None)
+        await _handoff_to_listener(session, outputs)
+        VT_SESSIONS.pop(session_id, None)
+        return
+
     # Convert opens a sub-menu first; the resolution comes back as "cvt:1080p".
     if op == OP_CONVERT and ":" not in op:
         await edit_message(
@@ -926,6 +1690,177 @@ async def video_tools_callback(client, query):
             buttons=build_resolution_keyboard(session_id),
         )
         await query.answer()
+        return
+
+    # ---- Trim sub-flow --------------------------------------------------
+    # Tap "✂️ Trim" → open preset picker + custom-range prompt.
+    if op == OP_TRIM:
+        videos = await find_videos(session["work_dir"])
+        if not videos:
+            await query.answer("No videos found.", show_alert=True)
+            return
+        # ffprobe the first video so we can show the source duration.
+        first = videos[0]
+        meta = await probe_video(first)
+        try:
+            dur = float(meta.get("format", {}).get("duration", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            dur = 0.0
+        session["trim_target"] = first
+        session["trim_duration"] = dur
+        await edit_message(
+            query.message,
+            (
+                "✂️ **Trim Video**\n"
+                f"📄 File: `{ospath.basename(first)}`\n"
+                f"⏱ Duration: **{_seconds_to_hms(dur) if dur else 'unknown'}**\n\n"
+                "Pick a preset, or tap **Custom range** and reply to the prompt "
+                "with `HH:MM:SS-HH:MM:SS` (e.g. `00:01:30-00:04:15`)."
+            ),
+            buttons=build_trim_keyboard(session_id),
+        )
+        await query.answer()
+        return
+
+    # Cancel an in-flight trim run (or any future cancellable op).
+    if op == TRM_CANCEL:
+        ev: asyncio.Event | None = session.get("trim_cancel")
+        if ev is not None and not ev.is_set():
+            ev.set()
+            await query.answer("Terminating…", show_alert=False)
+        else:
+            await query.answer("Nothing to cancel.")
+        return
+
+    # Custom range prompt → wait for user's text reply, then run with progress.
+    if op == TRM_INPUT:
+        target = session.get("trim_target") or (
+            (await find_videos(session["work_dir"])) or [None]
+        )[0]
+        if not target:
+            await query.answer("No video.", show_alert=True)
+            return
+
+        prompt_msg = await edit_message(
+            query.message,
+            (
+                "✏️ **Custom Trim Range**\n"
+                f"📄 File: `{ospath.basename(target)}`\n\n"
+                "Reply to *this message* with a range in the format\n"
+                "  `HH:MM:SS-HH:MM:SS`   or   `MM:SS-MM:SS`\n"
+                "_Waiting up to 2 minutes…_"
+            ),
+            buttons=None,
+        )
+        await query.answer()
+
+        chat_id = (
+            query.message.chat.id if query.message and query.message.chat else session["user_id"]
+        )
+        text = await _await_user_text_reply(client, session, chat_id, session["user_id"])
+        if not text:
+            await edit_message(
+                prompt_msg or query.message,
+                "⏳ Timed out waiting for a custom range. Tap Trim again to retry.",
+            )
+            return
+        # Validate format: must be START-END.
+        if "-" not in text:
+            await edit_message(
+                prompt_msg or query.message,
+                "❌ Bad format. Expected `HH:MM:SS-HH:MM:SS`.",
+            )
+            return
+        start, _, end = text.partition("-")
+        s_sec = _hms_to_seconds(start)
+        e_sec = _hms_to_seconds(end)
+        if s_sec is None or e_sec is None or e_sec <= s_sec:
+            await edit_message(
+                prompt_msg or query.message,
+                f"❌ Invalid range `{text}`. End must be after start.",
+            )
+            return
+
+        await _run_trim_with_progress(
+            client, query.message, session, session_id, target,
+            _seconds_to_hms(s_sec), _seconds_to_hms(e_sec),
+        )
+        return
+
+    # Preset trim: callback like "trmpre:00:00:00-00:00:30"
+    if op.startswith(TRM_PRESET + ":"):
+        target = session.get("trim_target") or (
+            (await find_videos(session["work_dir"])) or [None]
+        )[0]
+        if not target:
+            await query.answer("No video.", show_alert=True)
+            return
+        # Strip the leading "trmpre:" — the rest is the H:M:S-H:M:S range.
+        ts_range = op.split(":", 1)[1]
+        if "-" not in ts_range:
+            await query.answer("Bad preset range.", show_alert=True)
+            return
+        start, _, end = ts_range.partition("-")
+        s_sec = _hms_to_seconds(start)
+        e_sec = _hms_to_seconds(end)
+        if s_sec is None or e_sec is None or e_sec <= s_sec:
+            await query.answer("Invalid range.", show_alert=True)
+            return
+        await query.answer("Started")
+        await _run_trim_with_progress(
+            client, query.message, session, session_id, target,
+            _seconds_to_hms(s_sec), _seconds_to_hms(e_sec),
+        )
+        return
+
+    # Merge V+A / V+S open a language picker first; the picked ISO 639-2 code
+    # comes back as ``mlang:mva:eng`` (or :mvs: …). The constraints (C1 + C2)
+    # are still validated up-front — before opening the picker.
+    if op in (OP_MERGE_VA, OP_MERGE_VS):
+        err = _validate_pre_click(session, op)
+        if err:
+            await query.answer(err, show_alert=True)
+            return
+        kind = "audio" if op == OP_MERGE_VA else "subtitle"
+        await edit_message(
+            query.message,
+            f"🌐 **Pick a language for the new {kind} track**\n"
+            f"This tag is written into the MKV's stream metadata so players "
+            f"show it in the audio / subtitle picker.",
+            buttons=build_merge_lang_keyboard(session_id, op),
+        )
+        await query.answer()
+        return
+
+    # Language picker callback: rewrite the op + extra so the rest of the
+    # router treats it as a regular op-with-extra dispatch.
+    if op.startswith(MRG_LANG + ":"):
+        # data[2] == "mlang:mva:eng"  →  split twice
+        try:
+            _, real_op, lang_code = op.split(":", 2)
+        except ValueError:
+            await query.answer("Bad language payload.", show_alert=True)
+            return
+        op = real_op  # mva or mvs
+
+        # Run the merge with the language as extra, then return.
+        await edit_message(
+            query.message,
+            f"⏳ Running operation `{op}` :: lang=`{lang_code}` …",
+            buttons=None,
+        )
+        await query.answer("Started")
+        ok, msg, outputs = await _process_op(session, op, extra=lang_code)
+        if not ok:
+            await edit_message(query.message, f"❌ {msg}")
+            return
+        listing = "\n".join(f"• `{ospath.basename(o)}`" for o in outputs)
+        await edit_message(
+            query.message,
+            f"✅ {msg}\nProduced {len(outputs)} file(s):\n{listing}",
+        )
+        await _handoff_to_listener(session, outputs)
+        VT_SESSIONS.pop(session_id, None)
         return
 
     extra: str | None = None
