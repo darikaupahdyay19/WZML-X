@@ -87,6 +87,27 @@ RESOLUTION_MAP = {
     "360p":  (640, 360),
 }
 
+# Common ISO 639-2/B (3-letter) language codes used for Merge V+A and V+S
+# metadata tagging. The flag emoji is purely cosmetic on the button.
+COMMON_LANGS: list[tuple[str, str, str]] = [
+    ("🇬🇧", "eng", "English"),
+    ("🇯🇵", "jpn", "Japanese"),
+    ("🇮🇳", "hin", "Hindi"),
+    ("🇧🇩", "ben", "Bengali"),
+    ("🇪🇸", "spa", "Spanish"),
+    ("🇫🇷", "fre", "French"),
+    ("🇩🇪", "ger", "German"),
+    ("🇨🇳", "chi", "Chinese"),
+    ("🇰🇷", "kor", "Korean"),
+    ("🇷🇺", "rus", "Russian"),
+    ("🇸🇦", "ara", "Arabic"),
+    ("🇵🇹", "por", "Portuguese"),
+    ("🇮🇹", "ita", "Italian"),
+    ("🇹🇷", "tur", "Turkish"),
+    ("🇮🇩", "ind", "Indonesian"),
+    ("🇹🇭", "tha", "Thai"),
+]
+
 CALLBACK_PREFIX = "vt"
 
 # Operation codes used in callback_data and routing
@@ -108,6 +129,9 @@ CEX_TOGGLE = "cextog"   # toggle a single stream selection
 CEX_RUN    = "cexrun"   # run extraction with the current selection
 CEX_ALL    = "cexall"   # select all streams of a kind ("a" / "s" / "v")
 CEX_NONE   = "cexnone"  # clear selection
+
+# Sub-actions for the merge-V+A / V+S language picker
+MRG_LANG = "mlang"     # user picked a language for the merge op
 
 MERGE_OPS = {OP_MERGE_VV, OP_MERGE_VA, OP_MERGE_VS}
 INHERITED_OPS = {OP_TRIM, OP_WATERMARK, OP_REMOVE_VID, OP_EXTRACT_VID, OP_CONVERT}
@@ -302,6 +326,28 @@ def build_resolution_keyboard(session_id: int) -> Any:
     return buttons.build_menu(2)
 
 
+def build_merge_lang_keyboard(session_id: int, op: str) -> Any:
+    """Pick a language tag for the upcoming Merge V+A or V+S operation.
+
+    The chosen ISO-639-2 code travels through the callback as the ``extra``
+    component, e.g. ``vt <sid> mlang:mva:eng`` or ``…:mvs:jpn``.  Picking
+    "Skip" sends an empty extra so the merge runs with ``language=und``.
+    """
+    buttons = ButtonMaker()
+    for flag, code, name in COMMON_LANGS:
+        buttons.data_button(
+            f"{flag} {name}",
+            f"{CALLBACK_PREFIX} {session_id} {MRG_LANG}:{op}:{code}",
+        )
+    buttons.data_button(
+        "🌐 Undefined (skip)",
+        f"{CALLBACK_PREFIX} {session_id} {MRG_LANG}:{op}:und",
+        "footer",
+    )
+    buttons.data_button("⬅️ Back", f"{CALLBACK_PREFIX} {session_id} back", "footer")
+    return buttons.build_menu(b_cols=2, f_cols=2)
+
+
 # ---------------------------------------------------------------------------
 # FFmpeg operations (one coroutine per feature)
 # ---------------------------------------------------------------------------
@@ -328,27 +374,99 @@ async def op_merge_videos(videos: list[str], work_dir: str) -> str | None:
     return out_path if rc == 0 else None
 
 
-async def op_merge_video_audio(video: str, audio: str) -> str | None:
-    """2) Merge an external audio file with a video stream (copy both)."""
-    out_path = _output_path(video, "merged_audio")
+async def op_merge_video_audio(
+    video: str,
+    audio: str,
+    lang: str = "und",
+    title: str | None = None,
+) -> str | None:
+    """2) Merge an external audio file into the video container.
+
+    Behaviour:
+      * Output is forced to ``.mkv`` (Matroska is the only widely-deployed
+        container that copes with arbitrary codecs *and* attachments).
+      * **All** input-0 streams are kept (video, all existing audios, all
+        existing subs, all attachments / fonts) via ``-map 0``.
+      * The new audio is appended via ``-map 1:a:0`` and tagged with the
+        provided ISO-639-2 ``lang`` and a human-readable ``title`` (defaults
+        to the audio file's stem so the player picker stays useful).
+      * Codecs are copied — no re-encode.
+    """
+    out_path = _output_path(video, "merged_audio", ".mkv")
+    if not title:
+        title = ospath.splitext(ospath.basename(audio))[0]
+
+    # The new audio's index inside the *output* file is the count of
+    # input-0 streams that came before it. We don't know that without
+    # ffprobe, but ffmpeg's relative metadata syntax (``-metadata:s:a:N``
+    # where N is the audio-stream index in the output) handles the
+    # ordering for us. Tagging by output stream-type index is the most
+    # reliable choice.
     cmd = (
         f"{_ffmpeg()} -hide_banner -loglevel error -y "
         f"-i {shlex.quote(video)} -i {shlex.quote(audio)} "
-        f"-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -shortest "
+        f"-map 0 -map 1:a:0 -c copy "
+        f"-metadata:s:a:{{NEW_AUDIO}} language={shlex.quote(lang)} "
+        f"-metadata:s:a:{{NEW_AUDIO}} title={shlex.quote(title)} "
+        f"-disposition:a:{{NEW_AUDIO}} 0 "
         f"{shlex.quote(out_path)}"
     )
+    # Resolve the {NEW_AUDIO} placeholder to the index this new audio will
+    # occupy in the output file (= number of audios already in input 0).
+    meta = await probe_video(video)
+    existing_audios = sum(
+        1 for s in meta.get("streams", []) if s.get("codec_type") == "audio"
+    )
+    cmd = cmd.replace("{NEW_AUDIO}", str(existing_audios))
+
     rc, _, _ = await run_ffmpeg(cmd)
     return out_path if rc == 0 else None
 
 
-async def op_merge_video_subtitle(video: str, sub: str) -> str | None:
-    """3) Soft-mux subtitles (SRT/ASS) into an MKV container."""
+async def op_merge_video_subtitle(
+    video: str,
+    sub: str,
+    lang: str = "und",
+    title: str | None = None,
+) -> str | None:
+    """3) Soft-mux an external subtitle file into the video container.
+
+    Behaviour:
+      * Output is forced to ``.mkv`` so PGS / ASS / SRT / VTT all fit and
+        attachments survive.
+      * **All** input-0 streams are kept (video, all audios, all existing
+        subs, all attachments / fonts) via ``-map 0``.
+      * The new subtitle is appended via ``-map 1`` and tagged with the
+        provided ``lang`` and ``title``.
+      * The new subtitle's codec is copied; existing streams are left
+        untouched. SRT/ASS tag the new track for friendly player picking.
+    """
     out_path = _output_path(video, "softsub", ".mkv")
-    sub_codec = "ass" if ospath.splitext(sub)[1].lower() in {".ass", ".ssa"} else "srt"
+    if not title:
+        title = ospath.splitext(ospath.basename(sub))[0]
+
+    sub_ext = ospath.splitext(sub)[1].lower()
+    # We let ffmpeg auto-pick the subtitle codec on copy. It only needs an
+    # explicit ``-c:s`` when *trans-coding* between text formats; with -c
+    # copy the source is preserved verbatim.
+    sub_codec_flag = ""
+    if sub_ext in {".srt", ".vtt"}:
+        sub_codec_flag = " -c:s:0 srt"  # only the *new* sub stream
+    elif sub_ext in {".ass", ".ssa"}:
+        sub_codec_flag = " -c:s:0 ass"
+
+    meta = await probe_video(video)
+    existing_subs = sum(
+        1 for s in meta.get("streams", []) if s.get("codec_type") == "subtitle"
+    )
+
     cmd = (
         f"{_ffmpeg()} -hide_banner -loglevel error -y "
         f"-i {shlex.quote(video)} -i {shlex.quote(sub)} "
-        f"-map 0 -map 1 -c copy -c:s {sub_codec} "
+        f"-map 0 -map 1:0 -c copy{sub_codec_flag} "
+        f"-metadata:s:s:{existing_subs} language={shlex.quote(lang)} "
+        f"-metadata:s:s:{existing_subs} title={shlex.quote(title)} "
+        f"-disposition:s:{existing_subs} 0 "
         f"{shlex.quote(out_path)}"
     )
     rc, _, _ = await run_ffmpeg(cmd)
@@ -811,10 +929,13 @@ async def _process_op(session: dict, op: str, extra: str | None = None) -> tuple
         audios = await find_audios(work_dir)
         if not audios:
             return False, "Merge V+A requires at least one external audio file.", []
+        # `extra` arrives as the ISO 639-2 code picked from build_merge_lang_keyboard,
+        # or empty/None when invoked without a picker (defaults to "und").
+        lang = (extra or "und").strip() or "und"
         # With -m, pair videos[i] with audios[i] (round-robin). Without -m, just first.
         for i, v in enumerate(targets):
             a = audios[i % len(audios)]
-            out = await op_merge_video_audio(v, a)
+            out = await op_merge_video_audio(v, a, lang=lang)
             if out:
                 outputs.append(out)
 
@@ -823,9 +944,10 @@ async def _process_op(session: dict, op: str, extra: str | None = None) -> tuple
         subs = await find_subs(work_dir)
         if not subs:
             return False, "Merge V+S requires at least one subtitle file.", []
+        lang = (extra or "und").strip() or "und"
         for i, v in enumerate(targets):
             s = subs[i % len(subs)]
-            out = await op_merge_video_subtitle(v, s)
+            out = await op_merge_video_subtitle(v, s, lang=lang)
             if out:
                 outputs.append(out)
 
@@ -1220,6 +1342,56 @@ async def video_tools_callback(client, query):
             buttons=build_resolution_keyboard(session_id),
         )
         await query.answer()
+        return
+
+    # Merge V+A / V+S open a language picker first; the picked ISO 639-2 code
+    # comes back as ``mlang:mva:eng`` (or :mvs: …). The constraints (C1 + C2)
+    # are still validated up-front — before opening the picker.
+    if op in (OP_MERGE_VA, OP_MERGE_VS):
+        err = _validate_pre_click(session, op)
+        if err:
+            await query.answer(err, show_alert=True)
+            return
+        kind = "audio" if op == OP_MERGE_VA else "subtitle"
+        await edit_message(
+            query.message,
+            f"🌐 **Pick a language for the new {kind} track**\n"
+            f"This tag is written into the MKV's stream metadata so players "
+            f"show it in the audio / subtitle picker.",
+            buttons=build_merge_lang_keyboard(session_id, op),
+        )
+        await query.answer()
+        return
+
+    # Language picker callback: rewrite the op + extra so the rest of the
+    # router treats it as a regular op-with-extra dispatch.
+    if op.startswith(MRG_LANG + ":"):
+        # data[2] == "mlang:mva:eng"  →  split twice
+        try:
+            _, real_op, lang_code = op.split(":", 2)
+        except ValueError:
+            await query.answer("Bad language payload.", show_alert=True)
+            return
+        op = real_op  # mva or mvs
+
+        # Run the merge with the language as extra, then return.
+        await edit_message(
+            query.message,
+            f"⏳ Running operation `{op}` :: lang=`{lang_code}` …",
+            buttons=None,
+        )
+        await query.answer("Started")
+        ok, msg, outputs = await _process_op(session, op, extra=lang_code)
+        if not ok:
+            await edit_message(query.message, f"❌ {msg}")
+            return
+        listing = "\n".join(f"• `{ospath.basename(o)}`" for o in outputs)
+        await edit_message(
+            query.message,
+            f"✅ {msg}\nProduced {len(outputs)} file(s):\n{listing}",
+        )
+        await _handoff_to_listener(session, outputs)
+        VT_SESSIONS.pop(session_id, None)
         return
 
     extra: str | None = None
