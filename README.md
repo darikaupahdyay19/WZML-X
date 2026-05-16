@@ -20,6 +20,49 @@
 </div>
 
 ---
+
+## 🎞 Video Tools (`-vt`) — Mux audio into video
+
+WZML-X ships a post-download FFmpeg toolbox reachable via the `-vt` flag on `/mirror` (`/m`) and `/leech` (`/l`), or standalone via `/vtools`.
+
+### Quick Mux (Video + Audio) — the common case
+
+Send a video link and an audio link together with multi-mode and the bot will soft-mux them into a single `.mkv` automatically:
+
+```
+/leech -vt -m folder_name
+<video link>
+<audio link>
+```
+
+- **Auto-Mux is ON by default.** When `-vt -m` is used and the work-dir contains at least one video *and* one audio, the bot soft-muxes them (codecs copied, no re-encode) and uploads the merged `.mkv` without ever showing the menu.
+- To disable the fast path (always show the keyboard): set `VT_AUTO_MUX = False` in your `config.py` / env.
+- Inside the keyboard there is also a one-tap **⚡ Quick Mux (V+A, no prompt)** button that does the same thing without asking for a language tag.
+
+### Full toolbox (12 operations)
+
+| | Operation | Notes |
+|---:|---|---|
+| 1 | Merge V+V | concat-demux multiple videos (no re-encode) |
+| 2 | Merge V+A | soft-mux external audio + language picker |
+| 3 | Merge V+S | soft-mux external subtitle + language picker |
+| 4 | Hardsub | burn subtitles into the video stream |
+| 5 | SubSync | align subtitle timings to the audio track |
+| 6 | Compress | HEVC/x265 CRF 28 |
+| 7 | Trim | preset & custom ranges, live progress, terminate button |
+| 8 | Watermark | image (TL/TR/BL/BR) or `drawtext` |
+| 9 | Remove video stream | audio-only output |
+| 10 | Extract video stream | video-only output |
+| 11 | Custom Extract | toggleable per-stream extraction (V/A/S) |
+| 12 | Convert (Resize) | 1080p / 720p / 540p / 480p / 360p tiers |
+
+### Constraints
+
+- Merge ops (V+V / V+A / V+S / Quick Mux) require `-m`.
+- `-n` (rename) is rejected with merge ops.
+- Without `-m`, only the first video in the work-dir is processed.
+
+---
 Below is a refined version that preserves all the important details while enhancing readability and design :
 
 ---
