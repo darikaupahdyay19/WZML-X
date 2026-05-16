@@ -38,6 +38,13 @@ from .stats import bot_stats, stats_pages, get_packages_version
 from .status import task_status, status_pages
 from .users_settings import get_users_settings, edit_user_settings, send_user_settings
 from .ytdlp import ytdl, ytdl_leech
+from .video_tools import (
+    video_tools,
+    video_tools_command,
+    video_tools_callback,
+    register_video_tools_handlers,
+    process_video_tools,
+)
 
 __all__ = [
     "send_bot_settings",
@@ -103,4 +110,9 @@ __all__ = [
     "send_user_settings",
     "ytdl",
     "ytdl_leech",
+    "video_tools",
+    "video_tools_command",
+    "video_tools_callback",
+    "register_video_tools_handlers",
+    "process_video_tools",
 ]

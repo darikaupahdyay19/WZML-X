@@ -371,6 +371,18 @@ def add_handlers():
             & CustomFilters.authorized,
         )
     )
+
+    # Video Tools (-vt) module
+    TgClient.bot.add_handler(
+        MessageHandler(
+            video_tools_command,
+            filters=command(BotCommands.VideoToolsCommand, case_sensitive=True)
+            & CustomFilters.authorized,
+        )
+    )
+    TgClient.bot.add_handler(
+        CallbackQueryHandler(video_tools_callback, filters=regex(r"^vt "))
+    )
     if Config.SET_COMMANDS:
         global BOT_COMMANDS
 

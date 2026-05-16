@@ -114,6 +114,7 @@ class Mirror(TaskListener):
             "-bt": False,
             "-ut": False,
             "-yt": False,
+            "-vt": False,
             "-i": 0,
             "-sp": 0,
             "link": "",
@@ -184,6 +185,7 @@ class Mirror(TaskListener):
         self.bot_trans = args["-bt"]
         self.user_trans = args["-ut"]
         self.is_yt = args["-yt"]
+        self.video_tools = args["-vt"]
         self.metadata_dict = self.default_metadata_dict.copy()
         self.audio_metadata_dict = self.audio_metadata_dict.copy()
         self.video_metadata_dict = self.video_metadata_dict.copy()
