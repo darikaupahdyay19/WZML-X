@@ -779,11 +779,17 @@ async def _handoff_to_listener(session: dict, outputs: list[str]) -> None:
             listener.dir = ospath.dirname(outputs[0])
             listener.name = ospath.basename(listener.dir)
 
-        # Preferred WZML-X hook to move past download → upload.
-        if hasattr(listener, "proceed_upload"):
-            await listener.proceed_upload()
-        elif hasattr(listener, "on_download_complete"):
+        # Mark as handled so the listener doesn't re-open the menu on the
+        # second pass and instead proceeds straight to upload.
+        listener._vt_handled = True
+
+        # Re-enter the standard download-complete flow with the produced
+        # files in place. WZML-X's TaskListener.on_download_complete handles
+        # the rest (metadata, ffmpeg_cmds, mirror/leech upload, etc.).
+        if hasattr(listener, "on_download_complete"):
             await listener.on_download_complete()
+        elif hasattr(listener, "proceed_upload"):
+            await listener.proceed_upload()
     except Exception as e:
         LOGGER.error(f"[VT] Listener hand-off failed: {e}", exc_info=True)
 

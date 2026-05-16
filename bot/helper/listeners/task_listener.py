@@ -201,6 +201,19 @@ class TaskListener(TaskConfig):
         self.size = await get_path_size(dl_path)
         self.is_file = await aiopath.isfile(dl_path)
 
+        # Video Tools (-vt) hook: open the inline keyboard menu before
+        # upload begins. The menu's callback will set self._vt_handled and
+        # re-invoke on_download_complete so the produced files get uploaded
+        # through the regular pipeline.
+        if getattr(self, "video_tools", False) and not getattr(
+            self, "_vt_handled", False
+        ):
+            from ...modules.video_tools import process_video_tools
+
+            LOGGER.info(f"[VT] Dispatching to video tools menu for {self.name}")
+            await process_video_tools(self)
+            return
+
         if self.seed:
             up_dir = self.up_dir = f"{self.dir}10000"
             up_path = f"{self.up_dir}/{self.name}"
