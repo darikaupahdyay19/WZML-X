@@ -1118,19 +1118,22 @@ async def _select_targets(work_dir: str, multi: bool) -> list[str]:
 
 
 def _validate_pre_click(session: dict, op: str) -> str | None:
-    """Run constraints C1 and C2 at click time.
+    """Run constraint C1 at click time.
 
     Returns an error message to flash to the user, or ``None`` to proceed.
+
+    Note: the historical C2 ("merge requires -m") check has been removed.
+    Passing ``-vt`` (or invoking ``/vtools``) is itself the opt-in for
+    post-processing, so the menu always operates in multi-file mode and
+    the merge buttons just work against whatever is in the work-dir.
     """
     if op in MERGE_OPS:
-        # C2: Merge requires -m
-        if not session.get("multi"):
-            return "Merge requires -m argument for multi-file processing."
-        # C1: -n is not allowed with merges
+        # C1: -n is not allowed with merges (would conflict with the auto
+        # `.merged_audio.mkv` / `.softsub.mkv` / `merged_output.mkv` naming).
         if session.get("rename"):
             return (
                 "The -n (rename) flag is not allowed for Merge operations. "
-                "Use -n only with bulk/other video tools."
+                "Use -n only with non-merge video tools."
             )
     return None
 
@@ -1386,13 +1389,20 @@ async def _open_video_tools_menu(
         )
         return
 
+    # `-vt` is itself the opt-in for post-processing — the menu always
+    # operates in multi-file mode so merge buttons (V+V, V+A, V+S, Quick
+    # Mux) just work against whatever is in the work-dir. The user does
+    # NOT need to additionally pass `-m`. The local `multi` is preserved
+    # only for display so users see whether they used `-m` (cosmetic).
+    audios_count = len(await find_audios(work_dir))
+    subs_count = len(await find_subs(work_dir))
+
     sent = await send_message(
         message,
         (
             "🛠 **Video Tools (-vt)**\n"
             f"📂 Dir: `{work_dir}`\n"
-            f"🎞 Videos detected: **{len(videos)}**\n"
-            f"➕ Multi (-m): **{'on' if multi else 'off'}**\n"
+            f"🎞 Videos: **{len(videos)}**  ·  🔊 Audios: **{audios_count}**  ·  📝 Subs: **{subs_count}**\n"
             f"✏️ Rename (-n): **{rename or '—'}**\n\n"
             "Choose an operation:"
         ),
@@ -1404,7 +1414,8 @@ async def _open_video_tools_menu(
         VT_SESSIONS[sent.id] = {
             "user_id": user_id,
             "work_dir": work_dir,
-            "multi": multi,
+            # Always True now: -vt opts the user into multi-file mode.
+            "multi": True,
             "rename": rename,
             "listener": listener,
             "created_at": time.time(),
@@ -1951,15 +1962,20 @@ async def process_video_tools(listener) -> None:
     work_dir = getattr(listener, "dir", None) or await _resolve_work_dir(
         getattr(listener, "user_id", 0), listener
     )
-    multi = bool(getattr(listener, "multi", 0)) or bool(
-        getattr(listener, "folder_name", "")
-    )
+    # Passing ``-vt`` is the opt-in for post-processing, so we treat the
+    # session as multi-file unconditionally. This is critical because the
+    # listener's ``-m`` flag takes a folder-name *value* (it's the
+    # same-directory feature, not a boolean), so ``/l link -vt -m`` parses
+    # ``-m`` as empty-string and the previous gate (``multi = -m truthy``)
+    # silently blocked the merge buttons. See the menu's C1/C2 history.
+    multi = True
     rename = getattr(listener, "name", "") if getattr(listener, "_user_renamed", False) else ""
 
     # ---- Auto-mux fast path ---------------------------------------------
+    # Fires whenever -vt is set and the work-dir holds at least one video
+    # plus one external audio. Skips the menu entirely.
     if (
         getattr(Config, "VT_AUTO_MUX", True)
-        and multi
         and work_dir
         and await aiopath.isdir(work_dir)
     ):

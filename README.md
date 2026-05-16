@@ -27,15 +27,16 @@ WZML-X ships a post-download FFmpeg toolbox reachable via the `-vt` flag on `/mi
 
 ### Quick Mux (Video + Audio) — the common case
 
-Send a video link and an audio link together with multi-mode and the bot will soft-mux them into a single `.mkv` automatically:
+Pass `-vt` together with a multi-link batch, replying to a video+audio pair, or downloading them into the same task directory. The bot will soft-mux them into a single `.mkv` automatically:
 
 ```
-/leech -vt -m folder_name
+/leech -i 2 -vt
 <video link>
 <audio link>
 ```
 
-- **Auto-Mux is ON by default.** When `-vt -m` is used and the work-dir contains at least one video *and* one audio, the bot soft-muxes them (codecs copied, no re-encode) and uploads the merged `.mkv` without ever showing the menu.
+- **Auto-Mux is ON by default.** When `-vt` is set and the work-dir contains at least one video *and* one audio, the bot soft-muxes them (codecs copied, no re-encode) and uploads the merged `.mkv` without ever showing the menu.
+- `-m` is **not** required anymore — `-vt` itself is the opt-in.
 - To disable the fast path (always show the keyboard): set `VT_AUTO_MUX = False` in your `config.py` / env.
 - Inside the keyboard there is also a one-tap **⚡ Quick Mux (V+A, no prompt)** button that does the same thing without asking for a language tag.
 
@@ -58,9 +59,8 @@ Send a video link and an audio link together with multi-mode and the bot will so
 
 ### Constraints
 
-- Merge ops (V+V / V+A / V+S / Quick Mux) require `-m`.
-- `-n` (rename) is rejected with merge ops.
-- Without `-m`, only the first video in the work-dir is processed.
+- `-n` (rename) is rejected with merge ops (output names are auto-derived: `*.merged_audio.mkv`, `*.softsub.mkv`, `merged_output.mkv`).
+- The merge keyboard pairs videos[i] with audios[i] round-robin against everything in the work-dir.
 
 ---
 Below is a refined version that preserves all the important details while enhancing readability and design :
